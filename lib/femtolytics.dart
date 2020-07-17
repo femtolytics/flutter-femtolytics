@@ -83,7 +83,7 @@ class Femtolytics {
     });
   }
 
-  static void conversion(String goal, {Map<String, dynamic> properties}) {
+  static void goal(String goal, {Map<String, dynamic> properties}) {
     if (properties == null) {
       properties = {};
     }
