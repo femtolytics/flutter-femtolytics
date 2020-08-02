@@ -2,7 +2,7 @@
 A Flutter client for [femtolytics](https://femtolytics.com).
 
 ## Background
-Femtolytics is a small open-source mobile application analytics solution.
+Femtolytics is a lightweight open-source mobile application analytics solution.
 
 You can either use the hosted solution at [femtolytics](https://femtolytics.com) or host your own instance of femtolytics by using [django-femtolytics](https://github.com/femtolytics/django-femtolytics)
 
@@ -14,7 +14,7 @@ You should ensure that you add the dependency to your flutter project.
 
 ```
 dependencies:
- femtolytics: "^0.0.1"
+ femtolytics: "^1.0.0"
 ```
 
 You can also reference the git repo directly if you want:
@@ -36,6 +36,21 @@ class MyApp extends StatelessWidget {
     }
 }
 ```
+
+By default the SDK will not track events in a Simulator or in a Debug Build. You can change that behavior by passing flags to the ```setEndpoint()``` call.
+
+```dart
+class MyApp extends StatelessWidget {
+    MyApp() {
+        Femtolytics.setEndpoint(
+          'https://femtolytics.com/api/v1',
+          enableOnSimulator: true,
+          enableOnDebugBuild: true,
+        );
+    }
+}
+```
+
 
 The plugin queues in the event in a local database no matter, and will not lose events even if one were to happen before the endpoint is defined.
 
@@ -105,4 +120,13 @@ void main() {
     Femtolytics.crash(error, stackTrace);
   });
 }
+```
+
+
+## Opting Out
+
+If you want to offer a way for the user to opt-out of analytics, you can use the ```setOptOut()``` call.
+
+```dart
+Femtolytics.setOptOut(true);
 ```

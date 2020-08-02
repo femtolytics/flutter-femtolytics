@@ -1,6 +1,6 @@
 name: femtolytics
 description: A flutter client to femtolytics, a tiny app analytics open source framework.
-version: 0.0.1
+version: 1.0.0
 homepage: https://femtolytics.com
 
 environment:

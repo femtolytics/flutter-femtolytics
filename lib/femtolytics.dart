@@ -5,6 +5,7 @@ import 'dart:io' as io;
 import 'dart:math';
 
 import 'package:device_info/device_info.dart';
+import 'package:flutter/foundation.dart' as Foundation;
 import 'package:flutter/material.dart';
 import 'package:flutter_user_agent/flutter_user_agent.dart';
 import 'package:logging/logging.dart';
@@ -68,8 +69,21 @@ class Femtolytics {
 
   factory Femtolytics() => _instance;
 
-  static void setEndpoint(String url) {
-    Femtolytics()._tracker.setEndpoint(url);
+  static void setEndpoint(
+    String url, {
+    bool enableOnSimulator = false,
+    bool enableOnDebugBuild = false,
+    bool optedOutByDefault = false,
+  }) {
+    Femtolytics()._tracker.setEndpoint(
+          url,
+          enableOnSimulator: enableOnSimulator,
+          enableOnDebugBuild: enableOnDebugBuild,
+        );
+  }
+
+  void setOptOut(bool optout) {
+    Femtolytics()._tracker.setOptOut(optout);
   }
 
   static void action(String action, {Map<String, dynamic> properties}) {
@@ -98,11 +112,6 @@ class Femtolytics {
   _Tracker _tracker;
 }
 
-// uuid: 2.0.4
-// package_info: ^0.4.0+13
-// device_info: ^0.4.2+4
-// logging
-
 class _Action {
   final String action;
   final Map<String, dynamic> properties;
@@ -119,12 +128,20 @@ class _Event {
   _Event(this.event, this.properties, this.time);
 }
 
+class _Visitor {
+  final String id;
+  bool optedOut;
+  final DateTime created;
+
+  _Visitor(this.id, this.optedOut, this.created);
+}
+
 class _Tracker with WidgetsBindingObserver {
   final Logger log = new Logger('Femtolytics');
 
   String userAgent;
 
-  static final int _kCurrentVersion = 1;
+  static final int _kCurrentVersion = 2;
   static final String _kDatabaseFilename = 'femtolytics.db';
   static final String _kVisitorTable = 'visitor';
   static final String _kActionsTable = 'actions';
@@ -136,12 +153,16 @@ class _Tracker with WidgetsBindingObserver {
   String _baseURL;
   Database _database;
   PackageInfo _packageInfo;
-  String _visitorId;
+  _Visitor _visitor;
   String _device;
+  bool _isPhysicalDevice;
   String _os;
   Timer _timer;
   bool _initialized = false;
   Queue<dynamic> _queue = Queue();
+
+  bool _enabledOnSimulator = false;
+  bool _enabledOnDebugBuild = false;
 
   Future<void> initialize() async {
     io.Directory documentsDirectory = await getApplicationDocumentsDirectory();
@@ -151,22 +172,23 @@ class _Tracker with WidgetsBindingObserver {
       path,
       version: _kCurrentVersion,
       onCreate: _onCreate,
+      onUpgrade: _onUpgrade,
     );
 
     // Device and Operating System
     DeviceInfoPlugin deviceInfo = DeviceInfoPlugin();
     if (io.Platform.isIOS) {
       IosDeviceInfo info = await deviceInfo.iosInfo;
-      _device = info.isPhysicalDevice ? info.model : '${info.model} Simulator';
+      _device = info.model;
+      _isPhysicalDevice = info.isPhysicalDevice;
       _os = '${info.systemName} ${info.systemVersion}';
     } else if (io.Platform.isAndroid) {
       AndroidDeviceInfo info = await deviceInfo.androidInfo;
-      _device = info.isPhysicalDevice
-          ? '${info.brand} ${info.device}'
-          : '${info.brand} ${info.device} Simulator';
+      _device = '${info.brand} ${info.device}';
+      _isPhysicalDevice = info.isPhysicalDevice;
       _os = info.version.toString();
     }
-    log.fine('Device: $_device; OS: $_os');
+    log.fine('Device: $_device $_isPhysicalDevice; OS: $_os');
 
     // Application Information
     _packageInfo = await PackageInfo.fromPlatform();
@@ -178,13 +200,13 @@ class _Tracker with WidgetsBindingObserver {
     userAgent = FlutterUserAgent.webViewUserAgent;
 
     // User
-    _visitorId = await _getVisitorId();
-    if (_visitorId == null) {
-      _visitorId = Uuid().v4().toString();
-      log.fine('New User $_visitorId');
-      await _setVisitorId(_visitorId);
+    _visitor = await _getVisitor();
+    if (_visitor == null) {
+      String visitorId = Uuid().v4().toString();
+      log.fine('New User $visitorId');
+      _visitor = await _setVisitorId(visitorId);
       // Log Special Event
-      event('NEW_USER', properties: {'visitor_id': _visitorId});
+      event('NEW_USER', properties: {'visitor_id': _visitor.id});
     }
     // Monitor Lifecycle
     WidgetsBinding.instance.addObserver(this);
@@ -207,10 +229,27 @@ class _Tracker with WidgetsBindingObserver {
     _timer.cancel();
   }
 
-  void setEndpoint(String url) {
+  void setEndpoint(
+    String url, {
+    bool enableOnSimulator = false,
+    bool enableOnDebugBuild = false,
+  }) {
     this._baseURL = url;
+    this._enabledOnDebugBuild = enableOnDebugBuild;
+    this._enabledOnSimulator = enableOnSimulator;
     log.info('Using femtolytics endpoint $url');
     _dequeue();
+  }
+
+  void setOptOut(bool optout) {
+    _visitor.optedOut = optout;
+    _storeOptedOut(optout);
+  }
+
+  Future<void> _storeOptedOut(bool optout) async {
+    // Update DB
+    await _database.update(_kVisitorTable, {'opted_out': optout},
+        where: 'visitor_id = ?', whereArgs: [_visitor.id]);
   }
 
   void event(String event, {Map<String, dynamic> properties}) {
@@ -293,46 +332,95 @@ class _Tracker with WidgetsBindingObserver {
     }
   }
 
+  void _onUpgrade(Database database, int oldVersion, int version) async {
+    if (version == 2) {
+      await database.execute("""
+      ALTER TABLE visitor ADD COLUMN opted_out BOOL NOT NULL DEFAULT 0
+      """);
+
+      // ADD Things that could change (package_version, package_build, os)
+      await database.execute("""
+      ALTER TABLE actions ADD COLUMN os TEXT
+      """);
+      await database.execute("""
+      ALTER TABLE actions ADD COLUMN package_version TEXT
+      """);
+      await database.execute("""
+      ALTER TABLE actions ADD COLUMN package_build TEXT
+      """);
+      await database.execute("""
+      ALTER TABLE events ADD COLUMN os TEXT
+      """);
+      await database.execute("""
+      ALTER TABLE events ADD COLUMN package_version TEXT
+      """);
+      await database.execute("""
+      ALTER TABLE events ADD COLUMN package_build TEXT
+      """);
+    }
+  }
+
+  bool get enabled {
+    log.info(
+        'Physical $_isPhysicalDevice; Release: ${Foundation.kReleaseMode} Enabled On Simulator: $_enabledOnSimulator on Debug: $_enabledOnDebugBuild Opted Out: ${_visitor.optedOut}');
+    if (!_isPhysicalDevice && !_enabledOnSimulator) return false;
+    if (!Foundation.kReleaseMode && !_enabledOnDebugBuild) return false;
+    if (_visitor.optedOut) return false;
+    return true;
+  }
+
   Future<void> _storeAction(String action,
       {Map<String, dynamic> properties, DateTime time}) async {
+    if (!enabled) return;
+
     Map<String, dynamic> row = {};
     row['action'] = action;
     row['properties'] = _encoder.convert(properties);
-    row['visitor_id'] = _visitorId;
+    row['visitor_id'] = _visitor.id;
+    row['os'] = _os;
+    row['package_version'] = _packageInfo.version;
+    row['package_build'] = _packageInfo.buildNumber;
     row['created'] = time == null
-        ? DateTime.now().millisecondsSinceEpoch
-        : time.millisecondsSinceEpoch;
+        ? DateTime.now().toUtc().millisecondsSinceEpoch
+        : time.toUtc().millisecondsSinceEpoch;
     int id = await _database.insert(_kActionsTable, row);
     log.fine('Inserted action $id into database $action');
   }
 
   Future<void> _storeEvent(String event,
       {Map<String, dynamic> properties, DateTime time}) async {
+    if (!enabled) return;
+
     Map<String, dynamic> row = {};
     row['event'] = event;
     row['properties'] = _encoder.convert(properties);
-    row['visitor_id'] = _visitorId;
+    row['visitor_id'] = _visitor.id;
+    row['os'] = _os;
+    row['package_version'] = _packageInfo.version;
+    row['package_build'] = _packageInfo.buildNumber;
     row['created'] = time == null
-        ? DateTime.now().millisecondsSinceEpoch
-        : time.millisecondsSinceEpoch;
+        ? DateTime.now().toUtc().millisecondsSinceEpoch
+        : time.toUtc().millisecondsSinceEpoch;
     int id = await _database.insert(_kEventsTable, row);
     log.fine('Inserted event $id into database $event');
   }
 
-  Future<String> _getVisitorId() async {
-    var rows = await _database
-        .query(_kVisitorTable, columns: ['id', 'visitor_id', 'created']);
+  Future<_Visitor> _getVisitor() async {
+    var rows = await _database.query(_kVisitorTable,
+        columns: ['id', 'visitor_id', 'opted_out', 'created']);
     if (rows.length > 0) {
-      return rows.first['visitor_id'];
+      var row = rows.first;
+      return _Visitor(row['visitor_id'], row['opted_out'] == 1,
+          DateTime.fromMillisecondsSinceEpoch(row['created']));
     }
     return null;
   }
 
-  Future<int> _setVisitorId(String visitorId) async {
-    return _database.insert(_kVisitorTable, {
-      'visitor_id': visitorId,
-      'created': DateTime.now().millisecondsSinceEpoch
-    });
+  Future<_Visitor> _setVisitorId(String visitorId) async {
+    DateTime now = DateTime.now().toUtc();
+    await _database.insert(_kVisitorTable,
+        {'visitor_id': visitorId, 'created': now.millisecondsSinceEpoch});
+    return _Visitor(visitorId, false, now);
   }
 
   Future<void> _dequeue() async {
@@ -367,10 +455,15 @@ class _Tracker with WidgetsBindingObserver {
     for (var row in rows) {
       String action = row['action'];
       Map<String, dynamic> properties = _decoder.convert(row['properties']);
+      Map<String, dynamic> meta = {
+        'os': row['os'],
+        'package_version': row['package_version'],
+        'package_build': row['package_build'],
+      };
       DateTime time = DateTime.fromMillisecondsSinceEpoch(row['created']);
 
       Map<String, dynamic> message =
-          _actionToMap(action, time, properties: properties);
+          _actionToMap(action, time, properties: properties, meta: meta);
       log.fine('Message: $message');
       var body = {
         'actions': [message]
@@ -399,10 +492,15 @@ class _Tracker with WidgetsBindingObserver {
     for (var row in rows) {
       String event = row['event'];
       Map<String, dynamic> properties = _decoder.convert(row['properties']);
+      Map<String, dynamic> meta = {
+        'os': row['os'],
+        'package_version': row['package_version'],
+        'package_build': row['package_build'],
+      };
       DateTime time = DateTime.fromMillisecondsSinceEpoch(row['created']);
 
       Map<String, dynamic> message =
-          _eventToMap(event, time, properties: properties);
+          _eventToMap(event, time, properties: properties, meta: meta);
       log.fine('Message: $message');
       var body = {
         'events': [message]
@@ -433,25 +531,35 @@ class _Tracker with WidgetsBindingObserver {
     });
   }
 
-  Map<String, dynamic> _commonMap() {
+  Map<String, dynamic> _commonMap({Map<String, dynamic> meta}) {
     Map<String, dynamic> message = {};
     // Package
     message['package'] = {};
     message['package']['name'] = _packageInfo.packageName;
-    message['package']['version'] = _packageInfo.version;
-    message['package']['build'] = _packageInfo.buildNumber;
+    if (meta != null) {
+      message['package']['version'] = meta['package_version'];
+      message['package']['build'] = meta['package_build'];
+    } else {
+      message['package']['version'] = _packageInfo.version;
+      message['package']['build'] = _packageInfo.buildNumber;
+    }
     // Device
     message['device'] = {};
     message['device']['name'] = _device;
-    message['device']['os'] = _os;
+    message['device']['physical'] = _isPhysicalDevice;
+    if (meta != null) {
+      message['device']['os'] = meta['os'];
+    } else {
+      message['device']['os'] = _os;
+    }
     // User
-    message['visitor_id'] = _visitorId;
+    message['visitor_id'] = _visitor.id;
     return message;
   }
 
   Map<String, dynamic> _actionToMap(String action, DateTime actionTime,
-      {Map<String, dynamic> properties}) {
-    Map<String, dynamic> message = _commonMap();
+      {Map<String, dynamic> properties, Map<String, dynamic> meta}) {
+    Map<String, dynamic> message = _commonMap(meta: meta);
     // Action
     message['action'] = {};
     message['action']['type'] = action;
@@ -464,8 +572,8 @@ class _Tracker with WidgetsBindingObserver {
   }
 
   Map<String, dynamic> _eventToMap(String event, DateTime time,
-      {Map<String, dynamic> properties}) {
-    Map<String, dynamic> message = _commonMap();
+      {Map<String, dynamic> properties, Map<String, dynamic> meta}) {
+    Map<String, dynamic> message = _commonMap(meta: meta);
     // Event
     message['event'] = {};
     message['event']['type'] = event;
